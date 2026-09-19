@@ -2,189 +2,153 @@
 import numpy as np
 import os
 import arcpy
-
+import pandas as pd
 # get user entries
 pointFeature = arcpy.GetParameterAsText(0)
 caseField = arcpy.GetParameterAsText(1)
 outFolder = arcpy.GetParameterAsText(2)
-
-# initiate the lists
+# ===== READ ALL DATA =====
 pointsList = []
 fieldVal = []
-
-# get the x,y coordinate and field values
 with arcpy.da.SearchCursor(pointFeature, ["SHAPE@", caseField]) as cursor:
     for row in cursor:
         geom = row[0]
         field = row[1]
-        x = geom.centroid.X 
-        y = geom.centroid.Y 
-        pointsList.append([x, y])
+        pointsList.append([geom.centroid.X, geom.centroid.Y])
         fieldVal.append(field)
-
-# turn the lists into numpy arrays
+# ===== CONVERT TO NUMPY =====
 pointsArray = np.array(pointsList)
 fieldArray = np.array(fieldVal)
-
-# extract x,y median coordinates
+# ===== GLOBAL MAD CALCULATION =====
 centroidX = np.median(pointsArray[:, 0])
 centroidY = np.median(pointsArray[:, 1])
-
-# calculate the distance between each point and the median
 distances = np.sqrt(
     (pointsArray[:, 0] - centroidX) ** 2 +
     (pointsArray[:, 1] - centroidY) ** 2
 )
-
-# calculate the median of the distances
 distanceMed = np.median(distances)
-
-# calculate the median absolute deviation
 deviation = np.median(np.abs(distances - distanceMed))
-
-# create the median point
+# ===== CREATE GLOBAL OUTPUT =====
 medianCoord = arcpy.Point(centroidX, centroidY)
 medianPoint = arcpy.PointGeometry(medianCoord)
-
-# get the input spatial reference
 spatialReference = arcpy.Describe(pointFeature).spatialReference
-
-# locate the feature class destination
 featureLocation = os.path.join(outFolder, "medianFeature.shp")
-
-# create the feature class for median
-arcpy.management.CreateFeatureclass(
-    outFolder,
-    "medianFeature.shp",
-    "POINT",
-    spatial_reference=spatialReference
-)
-
-# insert the median point
+arcpy.management.CreateFeatureclass(outFolder, "medianFeature.shp", "POINT", spatial_reference=spatialReference)
 with arcpy.da.InsertCursor(featureLocation, ["SHAPE@"]) as cursor:
     cursor.insertRow([medianPoint])
-
-# create buffer destination
 bufferLocation = os.path.join(outFolder, "medianBuffer.shp")
-
-# create buffer
-arcpy.analysis.Buffer(
-    featureLocation,
-    bufferLocation,
-    deviation
-)
-
-# add outputs to the current map
+arcpy.analysis.Buffer(featureLocation, bufferLocation, deviation)
 aprx = arcpy.mp.ArcGISProject("CURRENT")
 mapObject = aprx.activeMap
 mapObject.addDataFromPath(featureLocation)
 mapObject.addDataFromPath(bufferLocation)
-
-# create a report 
-reportLocation = os.path.join(outFolder, 'report.txt')
-
-# threshold the values by coefficient of variation metrics
+# ===== CREATE REPORT =====
 cv = deviation / distanceMed
-
-# classify them
 if cv < 0.33:
     category = 'strongly clustered'
 elif cv < 0.67:
     category = 'moderately clustered'
 else:
     category = 'dispersed'
-    
-# define the report content 
-reportContent = f"""
-MAD calculation was performed successfully on {len(pointsList)} features.
-The median point location: ({centroidX},{centroidY})
-Median absolute deviation value: {deviation:.6f}
-
-INTERPRETATION
-the analysis yielded a coefficient value of {cv}, which indicates the data is {category}"""
-
-# write the report to the file 
+reportLocation = os.path.join(outFolder, 'report.txt')
+reportContent = f"""MAD calculation: {len(pointsList)} features
+Median: ({centroidX},{centroidY})
+MAD: {deviation:.6f}
+Category: {category}"""
 with open(reportLocation, 'w') as report:
     report.write(reportContent)
-
-# case-field based analysis
+# ===== PER-GROUP ANALYSIS (DEBUG VERSION) =====
 groupcCentLocation = os.path.join(outFolder, 'blockCentroid.shp')
 groupMADCircles = os.path.join(outFolder, 'MADCircles.shp')
-
-# Create shapefiles
 arcpy.management.CreateFeatureclass(outFolder, 'MADCircles.shp', 'POLYGON', spatial_reference=spatialReference)
 arcpy.management.CreateFeatureclass(outFolder, 'blockCentroid.shp', 'POINT', spatial_reference=spatialReference)
-
-# Add fields to centroid shapefile
 arcpy.management.AddField(groupcCentLocation, 'MAD', 'DOUBLE')
 arcpy.management.AddField(groupcCentLocation, 'FeatCount', 'SHORT')
 arcpy.management.AddField(groupcCentLocation, 'GroupName', 'TEXT')
-
-# Add fields to MAD circles shapefile
 arcpy.management.AddField(groupMADCircles, 'MAD', 'DOUBLE')
 arcpy.management.AddField(groupMADCircles, 'FeatCount', 'SHORT')
 arcpy.management.AddField(groupMADCircles, 'GroupName', 'TEXT')
-
-# separate features based on case fields
-uniqueGroups = set(fieldVal)
+# ===== PANDAS GROUPBY WITH DETAILED DEBUG =====
+df = pd.DataFrame({'x': pointsArray[:, 0], 'y': pointsArray[:, 1], 'group': fieldArray})
 groupMADdict = {}
-
-for group in uniqueGroups:
-    groupBoolean = np.array(fieldVal) == group 
-    groupFeatures = pointsArray[groupBoolean]
+centroid_rows = []
+buffer_rows = []
+# Create debug file
+debug_file = os.path.join(outFolder, 'MAD_DEBUG.txt')
+with open(debug_file, 'w') as debug:
+    debug.write("Block,FeatureCount,Centroid_X,Centroid_Y,X_Min,X_Max,Y_Min,Y_Max,Dist_Min,Dist_Max,Dist_Median,MAD_Raw,MAD_Final\n")
     
-    if len(groupFeatures) < 2:
-        continue 
-    
-    # Centroids
-    groupCentX = np.median(np.array(groupFeatures)[:,0])
-    groupCentY = np.median(np.array(groupFeatures)[:,1])
-    
-    # Distances from centroid
-    groupDistances = np.sqrt(
-        (np.array(groupFeatures)[:,0] - groupCentX)**2 + 
-        (np.array(groupFeatures)[:,1] - groupCentY)**2
-    )
-    
-    # Median distance
-    groupMedianDist = np.median(groupDistances)
-    
-    # Deviations from median distance
-    groupFeaturesDistances = np.abs(groupDistances - groupMedianDist)
-    
-    # MAD
-    groupMAD = np.median(groupFeaturesDistances)
-    groupMADdict[group] = groupMAD
-    
-    # Create point geometry
-    groupCentPair = arcpy.Point(groupCentX, groupCentY)
-    groupCentGeom = arcpy.PointGeometry(groupCentPair)
-    
-    # Write centroid
-    with arcpy.da.InsertCursor(groupcCentLocation, ['SHAPE@', 'MAD', 'FeatCount', 'GroupName']) as cursor:
-        cursor.insertRow([groupCentGeom, groupMAD, len(groupFeatures), str(group)])
-    
-    # Create and write buffer (only if MAD > 0.01)
-    if groupMAD > 0.01:
+    block_count = 0
+    for group_name, group_data in df.groupby('group'):
+        if len(group_data) < 2:
+            continue
+        
+        block_count += 1
+        
+        # Convert to numpy arrays
+        group_x = group_data['x'].values
+        group_y = group_data['y'].values
+        
+        # Calculate centroid
+        gx = np.median(group_x)
+        gy = np.median(group_y)
+        
+        # Calculate distances
+        dists = np.sqrt((group_x - gx) ** 2 + (group_y - gy) ** 2)
+        dist_med = np.median(dists)
+        
+        # Calculate MAD (BEFORE any modification)
+        mad_raw = np.median(np.abs(dists - dist_med))
+        mad_final = mad_raw
+        
+        # Only set minimum if actually zero
+        if mad_raw == 0:
+            mad_final = 0.0001
+        
+        groupMADdict[group_name] = mad_final
+        
+        # DEBUG: Write to file (first 50 blocks only, to keep file small)
+        if block_count <= 50:
+            debug.write(f"{group_name},{len(group_data)},{gx:.6f},{gy:.6f},{group_x.min():.6f},{group_x.max():.6f},{group_y.min():.6f},{group_y.max():.6f},{dists.min():.6f},{dists.max():.6f},{dist_med:.6f},{mad_raw:.10f},{mad_final:.10f}\n")
+        
+        geom = arcpy.PointGeometry(arcpy.Point(gx, gy))
+        centroid_rows.append([geom, mad_final, len(group_data), str(group_name)])
+        
+        if mad_final > 0.0001:
+            buffer_rows.append([geom.buffer(mad_final), mad_final, len(group_data), str(group_name)])
+arcpy.AddMessage(f"Processed {block_count} blocks")
+arcpy.AddMessage(f"Debug file created: {debug_file}")
+# ===== BATCH INSERT =====
+with arcpy.da.InsertCursor(groupcCentLocation, ['SHAPE@', 'MAD', 'FeatCount', 'GroupName']) as cursor:
+    for row in centroid_rows:
+        cursor.insertRow(row)
+with arcpy.da.InsertCursor(groupMADCircles, ['SHAPE@', 'MAD', 'FeatCount', 'GroupName']) as cursor:
+    for row in buffer_rows:
         try:
-            groupBuffer = groupCentGeom.buffer(groupMAD)
-            with arcpy.da.InsertCursor(groupMADCircles, ['SHAPE@', 'MAD', 'FeatCount', 'GroupName']) as cursor:
-                cursor.insertRow([groupBuffer, groupMAD, len(groupFeatures), str(group)])
-        except Exception as e:
+            cursor.insertRow(row)
+        except:
             pass
-
-# Add to map
 mapObject.addDataFromPath(groupcCentLocation)
 mapObject.addDataFromPath(groupMADCircles)
-
-# Add field to input feature
+# ===== UPDATE INPUT FEATURES =====
 arcpy.management.AddField(pointFeature, 'CaseMAD', 'DOUBLE')
-
-# Update each feature with its group's MAD
+with arcpy.da.UpdateCursor(pointFeature, ['CaseMAD']) as cursor:
+    for row in cursor:
+        row[0] = None
+        cursor.updateRow(row)
+groupMADdict_str = {str(k): v for k, v in groupMADdict.items()}
+update_count = 0
 with arcpy.da.UpdateCursor(pointFeature, ['CaseMAD', caseField]) as cursor:
     for row in cursor:
-        block = row[1]
-        if block in groupMADdict:
-            mad_value = groupMADdict[block]
-            row[0] = mad_value
-            cursor.updateRow(row)
+        block = str(row[1])
+        
+        if block in groupMADdict_str:
+            row[0] = groupMADdict_str[block]
+            update_count += 1
+        else:
+            row[0] = deviation
+        
+        cursor.updateRow(row)
+arcpy.AddMessage(f"\n===== COMPLETE =====")
+arcpy.AddMessage(f"Features updated: {update_count}")
+arcpy.AddMessage(f"Check debug file at: {debug_file}")
